@@ -9,7 +9,7 @@ const auditLogSchema = new mongoose.Schema({
     new_state: { type: Object, default: null },      // JSON después del cambio 
     timestamp: { type: Date, default: Date.now }
 });
-
+auditLogSchema.index({ timestamp: 1 }, { expireAfterSeconds: 259200 });
 // El log es inmutable: evitamos que se pueda editar o borrar desde la API 
 auditLogSchema.pre('save', function(next) {
     if (!this.isNew) return next(new Error('El log de auditoría no puede ser modificado.'));
