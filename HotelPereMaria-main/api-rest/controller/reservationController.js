@@ -2,6 +2,7 @@ const Reservation = require('../models/reservation');
 const mongoose = require('mongoose');
 const Room = require('../models/rooms'); 
 const {userDatabaseModel} = require("../models/user");
+const AuditLog = require('../models/auditLog');
 
 function parseDate(value) {
     const d = new Date(value);
@@ -137,70 +138,134 @@ async function createReservation(req, res) {
         res.status(500).json({ error: "Error al obtener tus reservas" });
     }
 }
-    
+
+//---*---
  async function cancelReservation(req, res) {
     const { id } = req.params;
+    const actorId = req.user.id; 
 
-    // Buscamos la reserva primero para validar su estado actual
     const reservation = await Reservation.findById(id);
-    if (!reservation) {
-        return res.status(404).json({ error: 'Reserva no encontrada' });
-    }
+    if (!reservation) return res.status(404).json({ error: 'Reserva no encontrada' });
 
-    if (reservation.status === 'cancelada') {
-        return res.status(400).json({ error: 'La reserva ya está cancelada' });
-    }
+    const oldState = reservation.toObject(); // Guardamos el estado previo 
 
-    // Usamos findByIdAndUpdate para evitar que la falta de numGuests en registros viejos bloquee el guardado
     const updatedReservation = await Reservation.findByIdAndUpdate(
         id,
         { status: 'cancelada' },
-        { new: true, runValidators: false } 
+        { new: true }
+    );
+
+    // Registro automático en el log 
+    await createAuditEntry(
+        id, 
+        'CANCELACION', 
+        actorId, 
+        'user',
+        oldState, 
+        updatedReservation.toObject()
     );
 
     res.json(updatedReservation);
 }
 
+//---*---
 async function checkIn(req, res) {
     const { id } = req.params;
+    const employeeId = req.user.id; // El trabajador que está usando el WPF [cite: 47]
 
-    const reservation = await Reservation.findById(id);
-    if (!reservation) {
-        return res.status(404).json({ error: 'Reserva no encontrada' });
+    try {
+        const reservation = await Reservation.findById(id);
+        if (!reservation) {
+            return res.status(404).json({ error: 'Reserva no encontrada' });
+        }
+
+        // Validación: Solo si está confirmada y es la fecha correcta [cite: 43]
+        if (reservation.status !== 'confirmada') {
+            return res.status(400).json({ error: 'Solo se puede hacer check-in de reservas confirmadas' });
+        }
+
+        const oldState = reservation.toObject();
+
+        // Actualizamos con los datos del empleado y nuevo estado [cite: 40, 53]
+        const updatedReservation = await Reservation.findByIdAndUpdate(
+            id,
+            { 
+                status: 'inHotel',
+                checkin_at: new Date(),
+                checkin_by: employeeId 
+            },
+            { new: true, runValidators: false }
+        );
+
+        //REGISTRO DE AUDITORÍA
+        await createAuditEntry(
+            id,
+            'CHECK-IN',
+            employeeId,
+            'employee', 
+            oldState,
+            updatedReservation.toObject()
+        );
+
+        res.json(updatedReservation);
+    } catch (err) {
+        res.status(500).json({ error: 'Error al procesar el check-in' });
     }
-
-    if (reservation.status !== 'confirmada') {
-        return res.status(400).json({
-            error: 'Solo se puede hacer check-in a reservas confirmadas'
-        });
-    }
-
-    // Actualización directa para saltar validaciones de campos obligatorios faltantes
-    const updatedReservation = await Reservation.findByIdAndUpdate(
-        id,
-        { status: 'terminada' },
-        { new: true, runValidators: false }
-    );
-
-    res.json(updatedReservation);
 }
 
 async function checkOut(req, res) {
     const { id } = req.params;
+    const employeeId = req.user.id;
 
-    const reservation = await Reservation.findById(id);
-    if (!reservation) {
-        return res.status(404).json({ error: 'Reserva no encontrada' });
+    try {
+        const reservation = await Reservation.findById(id);
+        if (!reservation) return res.status(404).json({ error: 'Reserva no encontrada' });
+
+        // Solo se puede hacer check-out si ya estaban en el hotel
+        const oldState = reservation.toObject();
+
+        const timestamp = Date.now().toString().slice(-6);
+        const generatedInvoiceNum = `FAC-${new Date().getFullYear()}-${timestamp}`;
+
+        const updatedReservation = await Reservation.findByIdAndUpdate(
+            id,
+            { 
+                status: 'terminada', 
+                checkout_at: new Date(),
+                checkout_by: employeeId,
+                invoice_number: generatedInvoiceNum
+            },
+            { new: true, runValidators: false }
+        );
+
+        //REGISTRO DE AUDITORÍA
+        await createAuditEntry(
+            id,
+            'CHECK-OUT',
+            employeeId,
+            'employee',
+            oldState,
+            updatedReservation.toObject()
+        );
+
+        const user = await userDatabaseModel.findById(reservation.userId);
+        if (user) {
+            // Ejemplo: 1 noche = 10 puntos
+            const diffInMs = reservation.checkOut - reservation.checkIn;
+            const nights = Math.ceil(diffInMs / (1000 * 60 * 60 * 24));
+            user.loyaltyPoints = (user.loyaltyPoints || 0) + (nights * 10);
+            await user.save();
+        }
+
+        res.json({
+            message: "Check-out completado y factura generada",
+            reservation: updatedReservation
+        });
+
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: 'Error en el proceso de salida' });
     }
-
-    // Actualización directa
-    const updatedReservation = await Reservation.findByIdAndUpdate(
-        id,
-        { status: 'terminada' },
-        { new: true, runValidators: false }
-    );
-
-    res.json(updatedReservation);
 }
 
   async function deleteReservation(req, res) {
@@ -225,6 +290,45 @@ async function checkOut(req, res) {
       return res.status(500).json({ error: 'Error interno del servidor' });
     }
   }
+
+//---*---
+async function createAuditEntry(bookingId, action, actorId, actorType, oldState, newState) {
+    try {
+        const log = new AuditLog({
+            booking_id: bookingId,
+            action: action,
+            actor_id: actorId,
+            actor_type: actorType, 
+            previous_state: oldState,
+            new_state: newState,
+            timestamp: new Date()
+        });
+        await log.save(); //guarda la entrada en la colección booking_audit_log
+    } catch (err) {
+        console.error("Error guardando el log de auditoría:", err);
+    }
+}
+
+//---*---
+async function getReservationAudit(req, res) {
+    try {
+        const { id } = req.params;
+
+        //Buscamos los logs asociados a la reserva
+        const auditLogs = await AuditLog.find({ booking_id: id })
+            .sort({ timestamp: 1 }); //De más antiguo a más reciente 
+
+        if (!auditLogs || auditLogs.length === 0) {
+            return res.status(404).json({ message: 'No hay historial para esta reserva.' });
+        }
+
+        //El log es solo de lectura
+        res.json(auditLogs);
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: 'Error al obtener el historial.' });
+    }
+}
   
 
   module.exports = {
@@ -237,7 +341,9 @@ async function checkOut(req, res) {
     checkOut,
     deleteReservation,
     parseDate,
-    startOfHotelDay
+    startOfHotelDay,
+    createAuditEntry,
+    getReservationAudit
   };
   
   

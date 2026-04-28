@@ -9,9 +9,14 @@ const reservationSchema = new mongoose.Schema({
     numGuests: { type: Number, required: true, min: 1 },
     status: {
       type: String,
-      enum: ['confirmada', 'terminada', 'cancelada'],
+      enum: ['confirmada', 'terminada', 'cancelada', 'inHotel'],
       default: 'confirmada'
-    }
+    },
+    checkin_at: { type: Date },
+    checkin_by: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+    checkout_at: { type: Date },
+    checkout_by: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+    invoice_number: { type: String, unique: true, sparse: true } // Se genera al salir
   });
 
 const Reservation = mongoose.model('Reservations',reservationSchema);
