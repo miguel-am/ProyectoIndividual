@@ -3,6 +3,7 @@ const mongoose = require('mongoose');
 const Room = require('../models/rooms'); 
 const {userDatabaseModel} = require("../models/user");
 const AuditLog = require('../models/auditLog');
+const config = require('../config');
 
 function parseDate(value) {
     const d = new Date(value);
@@ -293,7 +294,8 @@ async function checkOut(req, res) {
 
 //---*---
 async function createAuditEntry(bookingId, action, actorId, actorType, oldState, newState) {
-    try {
+  if (!config.LOGS_ENABLED) return;  
+  try {
         const log = new AuditLog({
             booking_id: bookingId,
             action: action,
