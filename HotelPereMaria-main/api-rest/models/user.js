@@ -83,6 +83,11 @@ const userDatabaseSchema = new Schema({
     vipStatus: {
         type: Boolean,
         default: false
+    },
+
+    fcmToken: {
+        type: String,
+        default: null
     }
 });
 

@@ -3,7 +3,12 @@ const mongoose = require('mongoose');
 const Room = require('../models/rooms'); 
 const {userDatabaseModel} = require("../models/user");
 const AuditLog = require('../models/auditLog');
-const config = require('../config');
+const Config = require('../models/Config');
+const Communication = require('../models/communication');
+const invoiceController = require('./invoiceController');
+const comController = require('./communicationController');
+const { sendPushNotification } = require('../services/notificationService');
+
 
 function parseDate(value) {
     const d = new Date(value);
@@ -18,14 +23,20 @@ function startOfHotelDay(date) {
 
 async function createReservation(req, res) {
   try {
-    const { userId, roomIds, checkIn, checkOut, numGuests } = req.body;
+    console.log(req.body)
+    if (!req.user || !req.user.id) {
+            return res.status(401).json({ error: 'Usuario no autenticado o token inválido' });
+        }
+    const actorId = req.user.id; 
+
     //Validaciones básicas
+    const { userId, roomIds, In, Out, numGuests } = req.body;
     if (!userId || !roomIds || !Array.isArray(roomIds) || roomIds.length === 0) {
       return res.status(400).json({ error: 'Debes seleccionar al menos una habitación' });
     }
 
-    const inDateRaw = parseDate(checkIn);
-    const outDateRaw = parseDate(checkOut);
+    const inDateRaw = parseDate(In);
+    const outDateRaw = parseDate(Out);
 
     if (!inDateRaw || !outDateRaw) {
       return res.status(400).json({ error: 'Fechas inválidas' });
@@ -50,12 +61,12 @@ async function createReservation(req, res) {
 
     //Buscamos colisiones
     const overlap = await Reservation.findOne({
-      status: { $ne: 'cancelada' },
+      status: { $nin: ['cancelada', 'terminada'] },
       roomIds: { $in: roomIds }, 
       $or: [
         {
-          checkIn: { $lt: outDate },
-          checkOut: { $gt: inDate }
+          In: { $lt: outDate },
+          Out: { $gt: inDate }
         }
       ]
     });
@@ -93,14 +104,47 @@ async function createReservation(req, res) {
     const reservation = new Reservation({
       userId,
       roomIds, 
-      checkIn: inDate,
-      checkOut: outDate,
+      In: inDate,
+      Out: outDate,
       totalPrice: finalPrice,
       numGuests: numGuests 
     });
 
-    await reservation.save();
-    return res.status(201).json(reservation);
+    const newRes = await reservation.save();
+    try {
+            await createAuditEntry(
+                reservation._id, 
+                'CREACION', 
+                actorId, 
+                null,
+                reservation.toObject()
+            );
+        } catch (logError) {
+            console.error('Error al crear entrada de auditoría:', logError);
+        }
+
+try {
+        // Buscamos al usuario para tener su email y nombre
+        const user = await userDatabaseModel.findById(newRes.userId);
+        if (user && user.email) {
+            // Llamamos al método "chapuza" (pero efectivo) del invoiceController
+            await invoiceController.sendWelcomeEmailInternal(
+                user.email, 
+                user.firstName, 
+                newRes._id
+            );
+
+            if (typeof comController.createCom === 'function') {
+                await comController.createCom(
+                    newRes._id, 
+                    'email', 
+                    'Email automático: Confirmación de reserva y bienvenida enviada.'
+                );
+            }
+        }
+    } catch (mailErr) {
+        console.error("No se pudo enviar el correo, pero la reserva es válida:", mailErr);
+    }    return res.status(201).json(reservation);
 
   } catch (err) {
     console.error(err);
@@ -128,6 +172,54 @@ async function createReservation(req, res) {
     res.json(reservation);
   }
 
+  // reservationController.js
+
+async function listTodayReservations(req, res) {
+    try {
+        const start = new Date();
+        start.setHours(0, 0, 0, 0);
+        
+        const end = new Date();
+        end.setHours(23, 59, 59, 999);
+
+        const reservations = await Reservation.find({
+            status: { $in: ['confirmada', 'inHotel'] },
+            
+            $or: [
+                { In: { $gte: start, $lte: end } },
+                { Out: { $gte: start, $lte: end } }
+            ]
+        }).populate({
+                path: 'userId',
+                model: 'user', 
+                select: 'firstName lastName email dni' 
+            })
+            .populate({ path: 'roomIds', 
+              model: 'Room', select: 'numRoom' });
+
+       const formattedResponse = reservations.map(r => {
+            const resObj = r.toObject();
+            return {
+                _id: resObj._id,
+                status: resObj.status,
+                totalPrice: resObj.totalPrice,
+                numRoom: resObj.roomIds && resObj.roomIds.length > 0 
+                    ? resObj.roomIds.map(room => room.numRoom).join(', ') 
+                    : "N/A",
+                userId: resObj.userId 
+            };
+        });
+
+        console.log(`Filtrando entre: ${start.toISOString()} y ${end.toISOString()}`);
+        console.log(`Encontradas: ${reservations.length}`);
+
+        res.json(formattedResponse);
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: err.message });
+    }
+}
+
   async function getUserReservations(req, res) {
     try {
         
@@ -141,76 +233,108 @@ async function createReservation(req, res) {
 }
 
 //---*---
- async function cancelReservation(req, res) {
-    const { id } = req.params;
-    const actorId = req.user.id; 
+async function cancelReservation(req, res) {
+    try {
+        const { id } = req.params;
+        // Si req.user no existe, es que el token no se validó correctamente
+        if (!req.user || !req.user.id) {
+            return res.status(401).json({ error: 'Usuario no autenticado o token inválido' });
+        }
+        const actorId = req.user.id; 
 
-    const reservation = await Reservation.findById(id);
-    if (!reservation) return res.status(404).json({ error: 'Reserva no encontrada' });
+        const reservation = await Reservation.findById(id);
+        if (!reservation) return res.status(404).json({ error: 'Reserva no encontrada' });
 
-    const oldState = reservation.toObject(); // Guardamos el estado previo 
+        const oldState = reservation.toObject(); 
 
-    const updatedReservation = await Reservation.findByIdAndUpdate(
-        id,
-        { status: 'cancelada' },
-        { new: true }
-    );
+        const updatedReservation = await Reservation.findByIdAndUpdate(
+            id,
+            { status: 'cancelada' },
+            { new: true }
+        );
 
-    // Registro automático en el log 
-    await createAuditEntry(
-        id, 
-        'CANCELACION', 
-        actorId, 
-        'user',
-        oldState, 
-        updatedReservation.toObject()
-    );
+        try {
+            await createAuditEntry(
+                reservation._id, 
+                'CANCELACION', 
+                actorId, 
+                oldState,
+                updatedReservation.toObject()
+            );
+        } catch (logError) {
+            console.error('Error al crear entrada de auditoría:', logError);
+        }
+        await comController.createCom(id, 'phone', 'Llamada registrada: El cliente cancela por motivos personales', req.user.firstName)
+        res.json(updatedReservation);
 
-    res.json(updatedReservation);
+    } catch (error) {
+        console.error('Error general en cancelReservation:', error);
+        res.status(500).json({ error: 'Error interno del servidor' });
+    }
 }
 
 //---*---
-async function checkIn(req, res) {
-    const { id } = req.params;
-    const employeeId = req.user.id; // El trabajador que está usando el WPF [cite: 47]
+// reservationController.js
 
+async function checkIn(req, res) {
     try {
-        const reservation = await Reservation.findById(id);
+        const { id } = req.params;
+        const employeeId = req.user.id; // Obtenemos el ID del empleado del token
+
+        // Buscamos la reserva
+        const reservation = await Reservation.findById(id).populate({
+            path:'userId',
+            model: 'user'});
+
         if (!reservation) {
             return res.status(404).json({ error: 'Reserva no encontrada' });
         }
 
-        // Validación: Solo si está confirmada y es la fecha correcta [cite: 43]
-        if (reservation.status !== 'confirmada') {
-            return res.status(400).json({ error: 'Solo se puede hacer check-in de reservas confirmadas' });
-        }
-
+        // Guardamos el estado anterior para el Log de auditoría
         const oldState = reservation.toObject();
 
-        // Actualizamos con los datos del empleado y nuevo estado [cite: 40, 53]
-        const updatedReservation = await Reservation.findByIdAndUpdate(
-            id,
-            { 
-                status: 'inHotel',
-                checkin_at: new Date(),
-                checkin_by: employeeId 
-            },
-            { new: true, runValidators: false }
-        );
+        reservation.status = 'inHotel';
+        reservation.checkin_at = new Date();    
+        reservation.checkin_by = employeeId;   
 
-        //REGISTRO DE AUDITORÍA
-        await createAuditEntry(
-            id,
-            'CHECK-IN',
-            employeeId,
-            'employee', 
-            oldState,
-            updatedReservation.toObject()
-        );
+        const updatedReservation = await reservation.save();
 
-        res.json(updatedReservation);
+        if (reservation.userId && reservation.userId.fcmToken) {
+                try {
+                await sendPushNotification(
+                    reservation.userId.fcmToken,
+                    "¡Bienvenido!",
+                    "Tu habitación está lista. ¡Disfruta de tu estancia!"
+                );
+            } catch (pushErr) {
+                console.error("Error en el envío satelital de Firebase:", pushErr.message);
+            }
+        } else {
+            console.log("El usuario no tiene fcmToken en la base de datos.");
+        }
+
+
+        // Esto hará que funcionen tus logs de "quién hizo qué"
+        if (typeof createAuditEntry === 'function') {
+            await createAuditEntry(
+                reservation._id,
+                'CHECK-IN',
+                employeeId,
+                oldState,
+                updatedReservation.toObject()
+            );
+        }
+        
+        await comController.createCom(id, 'push', 'Push enviado: ¡Bienvenido al hotel!')
+        return res.status(200).json({ 
+            message: 'Check-in realizado correctamente', 
+            status: updatedReservation.status,
+            checkin_at: updatedReservation.checkin_at
+        });
+
     } catch (err) {
-        res.status(500).json({ error: 'Error al procesar el check-in' });
+        console.error("ERROR CRÍTICO EN CHECKIN:", err);
+        return res.status(500).json({ error: err.message });
     }
 }
 
@@ -219,10 +343,11 @@ async function checkOut(req, res) {
     const employeeId = req.user.id;
 
     try {
-        const reservation = await Reservation.findById(id);
+        const reservation = await Reservation.findById(id).populate({
+            path:'userId',
+            model: 'user'});
         if (!reservation) return res.status(404).json({ error: 'Reserva no encontrada' });
 
-        // Solo se puede hacer check-out si ya estaban en el hotel
         const oldState = reservation.toObject();
 
         const timestamp = Date.now().toString().slice(-6);
@@ -237,14 +362,14 @@ async function checkOut(req, res) {
                 invoice_number: generatedInvoiceNum
             },
             { new: true, runValidators: false }
+            
         );
 
         //REGISTRO DE AUDITORÍA
         await createAuditEntry(
-            id,
+            reservation._id,
             'CHECK-OUT',
             employeeId,
-            'employee',
             oldState,
             updatedReservation.toObject()
         );
@@ -252,12 +377,25 @@ async function checkOut(req, res) {
         const user = await userDatabaseModel.findById(reservation.userId);
         if (user) {
             // Ejemplo: 1 noche = 10 puntos
-            const diffInMs = reservation.checkOut - reservation.checkIn;
+            const diffInMs = reservation.Out - reservation.In;
             const nights = Math.ceil(diffInMs / (1000 * 60 * 60 * 24));
             user.loyaltyPoints = (user.loyaltyPoints || 0) + (nights * 10);
             await user.save();
         }
 
+        if (reservation.userId && reservation.userId.fcmToken) {
+            try {
+                await sendPushNotification(
+                    reservation.userId.fcmToken,
+                    "Gracias por tu visita",
+                    "Nos encantaría saber tu opinión. ¡Haz clic aquí para valorar tu estancia!"
+                );
+            } catch (pushErr) {
+                console.error("Error al enviar push en checkOut:", pushErr.message);
+            }
+        }
+
+        await comController.createCom(id, 'push', 'Check-Out realizado. Notificación enviada al cliente.', req.user.name);
         res.json({
             message: "Check-out completado y factura generada",
             reservation: updatedReservation
@@ -272,9 +410,14 @@ async function checkOut(req, res) {
   async function deleteReservation(req, res) {
     try {
       const { id } = req.params;
+      const actorId = (req.user && req.user.id) ? req.user.id : null; 
   
       if (!id || !mongoose.isValidObjectId(id)) {
         return res.status(400).json({ error: 'ID inválido' });
+      }
+
+      if (!actorId) {
+        return res.status(401).json({ error: "No se pudo identificar al autor de la eliminación" });
       }
   
       const reservation = await Reservation.findById(id);
@@ -284,6 +427,17 @@ async function checkOut(req, res) {
       }
   
       await Reservation.findByIdAndDelete(id);
+      try {
+            await createAuditEntry(
+                reservation._id, 
+                'ELIMINACION', 
+                req.user.id, 
+                reservation.toObject(),
+                null
+            );
+        } catch (logError) {
+            console.error('Error al crear entrada de auditoría:', logError);
+        }
   
       return res.status(200).json({ message: 'Reserva eliminada correctamente' });
     } catch (err) {
@@ -292,20 +446,26 @@ async function checkOut(req, res) {
     }
   }
 
-//---*---
-async function createAuditEntry(bookingId, action, actorId, actorType, oldState, newState) {
-  if (!config.LOGS_ENABLED) return;  
+
+  
+//=============================================//
+//================AUDITORIAS===================//
+//=============================================// 
+async function createAuditEntry(bookingId, action, actorId, oldState, newState) {
   try {
+
+    const config = await Config.findOne({ key: 'global_config' });
+        if (!config || !config.logsEnabled) return; // Si están desactivados, salimos
+        
         const log = new AuditLog({
             booking_id: bookingId,
             action: action,
             actor_id: actorId,
-            actor_type: actorType, 
             previous_state: oldState,
             new_state: newState,
             timestamp: new Date()
         });
-        await log.save(); //guarda la entrada en la colección booking_audit_log
+        await log.save(); 
     } catch (err) {
         console.error("Error guardando el log de auditoría:", err);
     }
@@ -315,28 +475,58 @@ async function createAuditEntry(bookingId, action, actorId, actorType, oldState,
 async function getReservationAudit(req, res) {
     try {
         const { id } = req.params;
+        const query = (id === 'all') ? {} : { booking_id: id };
 
-        //Buscamos los logs asociados a la reserva
-        const auditLogs = await AuditLog.find({ booking_id: id })
-            .sort({ timestamp: 1 }); //De más antiguo a más reciente 
+        // Buscamos los logs y usamos 'populate' para traer los datos del usuario/empleado
+        const auditLogs = await AuditLog.find(query)
+            .populate('actor_id', 'firstName lastName')
+            .populate({
+                path: 'booking_id', 
+                populate: [
+                    { path: 'roomIds', select: 'roomNumber', model: 'Room' }, 
+                    { path: 'userId', select: 'firstName lastName', model: 'user'} 
+                ]
+            }) 
+            .sort({ timestamp: -1 });
 
+       
         if (!auditLogs || auditLogs.length === 0) {
-            return res.status(404).json({ message: 'No hay historial para esta reserva.' });
+            return res.status(404).json({ message: 'No hay historial.' });
         }
-
-        //El log es solo de lectura
         res.json(auditLogs);
     } catch (err) {
         console.error(err);
         res.status(500).json({ error: 'Error al obtener el historial.' });
     }
 }
-  
+
+async function completeReservation(req, res) {
+    try {
+        const { id } = req.params;
+        const reservation = await Reservation.findById(id);
+
+        if (!reservation.invoice_number) {
+            const count = await Reservation.countDocuments({ invoice_number: { $exists: true } });
+            reservation.invoice_number = `FAC-${new Date().getFullYear()}-${(count + 1).toString().padStart(3, '0')}`;
+            reservation.status = 'terminada';
+            await reservation.save();
+        }
+
+        res.json({ message: "Factura generada", number: reservation.invoice_number });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+}
+
+
+
+
 
   module.exports = {
     createReservation,
     listReservations,
     getReservation,
+    listTodayReservations,
     getUserReservations,
     cancelReservation,
     checkIn,

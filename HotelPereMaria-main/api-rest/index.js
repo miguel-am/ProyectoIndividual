@@ -1,11 +1,15 @@
+const path = require('path');
+require('dotenv').config({ path: path.join(__dirname, '.env') });const dns = require('node:dns');
+dns.setDefaultResultOrder('ipv4first');
 const express = require ('express');
 const mongoose = require('mongoose');
-require('dotenv').config();
 const reservationRoutes = require ('./routes/reservationRoutes');
 const usersRoutes = require ('./routes/userRoutes');
 const habitacionRoutes = require ('./routes/habitacionRoutes');
 const reviewRoutes = require ('./routes/reviewRoutes');
-const  authRouter  = require('./routes/authRouter');
+const authRouter  = require('./routes/authRouter');
+const invoiceRoutes = require('./routes/invoiceRoutes');
+const comRoutes = require('./routes/comRoutes');
 
 
 const app = express();
@@ -19,9 +23,12 @@ app.use('/users',usersRoutes);
 app.use('/rooms',habitacionRoutes);
 app.use('/auth',authRouter)
 app.use('/reviews',reviewRoutes)
+app.use('/invoices', invoiceRoutes);
+app.use('/communications', comRoutes);
+
 
 const PORT = process.env.PORT || 3000;
-const MONGO_URI = process.env.MONGO_URI;
+const MONGO_URI = 'mongodb://127.0.0.1:27017/HotelPereMaria';
 
 if (!MONGO_URI) {
   console.error("Falta MONGO_URI en el entorno");
